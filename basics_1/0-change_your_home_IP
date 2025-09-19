@@ -1,86 +1,54 @@
 #!/usr/bin/env bash
-# Configure /etc/hosts so: localhost -> 127.0.0.2, facebook.com -> 8.8.8.8
+# Set /etc/hosts so that: localhost -> 127.0.0.2 and facebook.com -> 8.8.8.8 (silent & idempotent)
 
 set -euo pipefail
 
-HOSTS_FILE="/etc/hosts"
-BACKUP="/etc/hosts.bak.$(date +%s)"
-
-# Must be root (the checker usually calls with sudo)
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  printf '%s\n' "This script must be run as root (try: sudo $0)" >&2
-  exit 1
-fi
-
-# Ensure hosts file exists
-if [ ! -f "$HOSTS_FILE" ]; then
-  printf '%s\n' "Hosts file not found at $HOSTS_FILE" >&2
-  exit 1
-fi
-
-# Backup current hosts
-cp -p "$HOSTS_FILE" "$BACKUP"
-
+hosts="/etc/hosts"
 tmp="$(mktemp)"
-tmp_intermediate="$(mktemp)"
+tmp2="$(mktemp)"
 
-cleanup() {
-  rc=$?
-  # On failure, restore backup
-  if [ "$rc" -ne 0 ]; then
-    printf '%s\n' "Error occurred. Restoring backup $BACKUP to $HOSTS_FILE." >&2
-    cp -f "$BACKUP" "$HOSTS_FILE" || true
-  fi
-  rm -f "$tmp" "$tmp_intermediate" 2>/dev/null || true
-  exit "$rc"
-}
-trap cleanup EXIT
-
-# 1) Put our desired mappings at the top (they'll take precedence)
+# 1) 望む2行を先頭に書く（優先解決のため）
 {
-  printf '%s\n' "127.0.0.2 localhost"
-  printf '%s\n' "8.8.8.8 facebook.com"
-} > "$tmp"
+  printf '127.0.0.2 localhost\n'
+  printf '8.8.8.8 facebook.com\n'
+  # 2) 既存hostsを整形:
+  #    - facebook.com を含む行は除去（上で固定するため）
+  #    - 127.0.0.1 の行から localhost 系だけ除外（127.0.0.2 を優先させるため）
+  #    - コメント/空行はそのまま
+  awk '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { print; next }
 
-# 2) Append existing hosts content, but:
-#    - Remove any existing mapping for facebook.com
-#    - Remove the token 'localhost' from IPv4 127.0.0.1 lines
-#    - Keep everything else as-is
-awk '
-  BEGIN { OFS=" " }
-  {
-    orig=$0
-    # Pass through comments/blank lines unchanged
-    if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) { print orig; next }
-
-    # Drop any line that mentions facebook.com (we add our own)
-    for (i=1; i<=NF; i++) {
-      if ($i == "facebook.com") { next }
+    {
+      # facebook.com を消す
+      for (i=1; i<=NF; i++) if ($i=="facebook.com") $i=""
+      # フィールド詰め直し
+      line=""
+      for (i=1; i<=NF; i++) if ($i!="") line = (line ? line FS $i : $i)
+      if (line=="") next
+      $0=line
     }
 
-    # On 127.0.0.1 lines, remove localhost token(s) so our 127.0.0.2 takes effect
-    if ($1 == "127.0.0.1") {
-      names=""
+    $1=="127.0.0.1" {
+      out=$1; kept=0
       for (i=2; i<=NF; i++) {
-        if ($i != "localhost" && $i != "localhost.localdomain") {
-          if (names == "") { names = $i } else { names = names " " $i }
+        if ($i!="localhost" && $i!="localhost.localdomain") {
+          out = out FS $i
+          kept=1
         }
       }
-      if (names == "") { next }            # Avoid a bare IP-only line
-      print $1, names
+      if (kept) print out
       next
     }
 
-    # Otherwise keep the line unmodified
-    print orig
-  }
-' "$HOSTS_FILE" >> "$tmp"
+    { print }
+  ' "$hosts"
+} > "$tmp"
 
-# 3) Deduplicate identical lines while preserving order
-awk '!seen[$0]++' "$tmp" > "$tmp_intermediate"
+# 3) 先頭勝ちのまま重複行を除去（順序保持）
+awk '!seen[$0]++' "$tmp" > "$tmp2"
 
-# 4) Overwrite /etc/hosts contents (preserves original permissions)
-cat "$tmp_intermediate" > "$HOSTS_FILE"
+# 4) 置換（権限は /etc/hosts のものが維持される）
+cat "$tmp2" > "$hosts"
 
-# Success message (backup kept in case you want to revert)
-printf 'Updated %s (backup saved at %s)\n' "$HOSTS_FILE" "$BACKUP"
+rm -f "$tmp" "$tmp2"
+
